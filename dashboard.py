@@ -174,6 +174,62 @@ def load_market_prices(filepath):
     return df
 
 
+@st.cache_data
+def load_production_data(filepath):
+    """
+    Reads the Production Tracker sheet from your Excel file.
+    One row per crop batch. You manage this sheet directly in Excel.
+    """
+    try:
+        df = pd.read_excel(filepath, sheet_name="Production Tracker", header=0)
+        df.columns = df.columns.str.strip()
+        df = df.dropna(subset=["Crop"])
+        df = df[df["Crop"].astype(str).str.strip() != ""]
+        df["Date Planted"] = pd.to_datetime(df["Date Planted"], errors="coerce")
+        for col in ["Rows", "Total Plants", "Expected Harvest (kg)"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        for col in ["First Harvest Date", "Last Harvest Date"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            else:
+                df[col] = pd.NaT
+        if "Status" not in df.columns:
+            df["Status"] = "Unknown"
+        df["Status"] = df["Status"].astype(str).str.strip()
+        if "Location" not in df.columns:
+            df["Location"] = "Unknown"
+        df["Location"] = df["Location"].astype(str).str.strip()
+        if "Notes" not in df.columns:
+            df["Notes"] = ""
+        return df.reset_index(drop=True)
+    except Exception as e:
+        return pd.DataFrame({"_error": [str(e)]})
+
+
+@st.cache_data
+def load_harvest_log(filepath):
+    """
+    Reads the Harvest Log sheet.
+    Each row is one harvest event: Date, Crop, Kg Harvested, Notes.
+    """
+    try:
+        df = pd.read_excel(filepath, sheet_name="Harvest Log", header=0)
+        df.columns = df.columns.str.strip()
+        if df.empty or "Crop" not in df.columns:
+            return pd.DataFrame(columns=["Date", "Crop", "Kg Harvested", "Notes"])
+        df = df.dropna(subset=["Crop"])
+        df = df[df["Crop"].astype(str).str.strip() != ""]
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df["Kg Harvested"] = pd.to_numeric(df["Kg Harvested"], errors="coerce").fillna(0)
+        df["Crop"] = df["Crop"].astype(str).str.strip()
+        if "Notes" not in df.columns:
+            df["Notes"] = ""
+        return df.sort_values("Date").reset_index(drop=True)
+    except Exception as e:
+        return pd.DataFrame(columns=["Date", "Crop", "Kg Harvested", "Notes"])
+
+
 # ─────────────────────────────────────────────────────────
 # 4. DATA FILE
 # The Excel file loads automatically from the same folder as this script.
@@ -194,6 +250,8 @@ if not DATA_FILE.exists():
 df               = load_sales_data(str(DATA_FILE))
 scenarios_df     = load_scenarios_data(str(DATA_FILE))
 market_prices_df = load_market_prices(str(DATA_FILE))
+production_df    = load_production_data(str(DATA_FILE))
+harvest_df       = load_harvest_log(str(DATA_FILE))
 
 # Sidebar reload button
 st.sidebar.header("📂 Data")
@@ -642,117 +700,225 @@ with tab3:
 
 # ══════════════════════════════════════════════════════════
 # TAB 4 — PRODUCTION TRACKER
+# Reads from Production Tracker and Harvest Log sheets.
+# Update those sheets in Excel and push to GitHub to refresh.
 # ══════════════════════════════════════════════════════════
 with tab4:
     st.header("Production Tracker")
-    st.caption("Track what is currently growing in the greenhouse")
+    st.caption(
+        "Managed via the **Production Tracker** and **Harvest Log** sheets "
+        "in your Excel file. Update and push to GitHub to refresh."
+    )
 
-    PROD_FILE = Path(__file__).parent / "production_data.csv"
-
-    if PROD_FILE.exists():
-        prod_df = pd.read_csv(str(PROD_FILE), parse_dates=["Date Planted"])
+    if production_df.empty or "_error" in production_df.columns:
+        err = production_df["_error"].iloc[0] if "_error" in production_df.columns else ""
+        if err:
+            st.error(f"Could not load Production Tracker sheet. Error: {err}")
+        else:
+            st.info("No production records found. Add rows to the Production Tracker sheet.")
     else:
-        prod_df = pd.DataFrame(columns=[
-            "Crop", "Date Planted", "Rows", "Plants per Row",
-            "Total Plants", "Expected Harvest (kg)", "Status", "Notes"
-        ])
-
-    st.subheader("➕ Add / Update Crop")
-    with st.form("add_crop_form"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            crop_name   = st.text_input("Crop Name", placeholder="e.g. Tomato")
-            date_planted = st.date_input("Date Planted", value=date.today())
-        with col2:
-            rows           = st.number_input("Number of Rows", min_value=1, value=1, step=1)
-            plants_per_row = st.number_input("Plants per Row", min_value=1, value=10, step=1)
-        with col3:
-            expected_harvest = st.number_input(
-                "Expected Total Harvest (kg)", min_value=0.0, value=0.0, step=0.5
+        # ── Build cumulative harvest from Harvest Log ──
+        # For each crop, sum all Kg Harvested entries
+        if not harvest_df.empty:
+            cumulative = (
+                harvest_df.groupby("Crop")["Kg Harvested"]
+                .sum().reset_index()
+                .rename(columns={"Kg Harvested": "Actual Harvest (kg)"})
             )
-            status = st.selectbox(
-                "Growth Status",
-                ["Seedling", "Growing", "Flowering", "Producing", "Completed"]
-            )
-        notes     = st.text_input("Notes (optional)")
-        submitted = st.form_submit_button("Save Crop Record")
+            prod_display = production_df.merge(cumulative, on="Crop", how="left")
+        else:
+            prod_display = production_df.copy()
+            prod_display["Actual Harvest (kg)"] = 0
 
-        if submitted and crop_name:
-            total_plants = rows * plants_per_row
-            new_row = {
-                "Crop": crop_name,
-                "Date Planted": pd.Timestamp(date_planted),
-                "Rows": rows,
-                "Plants per Row": plants_per_row,
-                "Total Plants": total_plants,
-                "Expected Harvest (kg)": expected_harvest,
-                "Status": status,
-                "Notes": notes
-            }
-            prod_df = pd.concat(
-                [prod_df, pd.DataFrame([new_row])], ignore_index=True
-            )
-            prod_df.to_csv(str(PROD_FILE), index=False)
-            st.success(
-                f"Saved: {crop_name} — {rows} rows × {plants_per_row} plants "
-                f"= {total_plants} plants total"
-            )
-            st.rerun()
+        prod_display["Actual Harvest (kg)"] = prod_display["Actual Harvest (kg)"].fillna(0)
+        prod_display["Harvest Progress (%)"] = (
+            prod_display["Actual Harvest (kg)"] /
+            prod_display["Expected Harvest (kg)"].replace(0, 1) * 100
+        ).round(1)
+        prod_display["Remaining (kg)"] = (
+            prod_display["Expected Harvest (kg)"] - prod_display["Actual Harvest (kg)"]
+        ).clip(lower=0)
 
-    st.divider()
+        # ── SUMMARY CARDS ──
+        active_statuses = ["Seedling", "Growing", "Flowering", "Producing"]
+        active = prod_display[prod_display["Status"].isin(active_statuses)]
 
-    if prod_df.empty:
-        st.info("No production records yet. Use the form above to add your first crop.")
-    else:
-        col1, col2, col3, col4 = st.columns(4)
-        active = prod_df[prod_df["Status"].isin(["Growing", "Flowering", "Producing"])]
-        col1.metric("Crops Active",    len(active))
-        col2.metric("Total Rows",      int(prod_df["Rows"].sum()))
-        col3.metric("Total Plants",    int(prod_df["Total Plants"].sum()))
-        col4.metric("Expected Harvest", f"{prod_df['Expected Harvest (kg)'].sum():.1f} kg")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Active Crops",       len(active))
+        col2.metric("Total Rows",         int(prod_display["Rows"].sum()))
+        col3.metric("Total Plants",       int(prod_display["Total Plants"].sum()))
+        col4.metric("Expected Harvest",   f"{prod_display['Expected Harvest (kg)'].sum():.1f} kg")
+        col5.metric("Actual Harvest",     f"{prod_display['Actual Harvest (kg)'].sum():.1f} kg")
 
-        st.subheader("Crop Status Overview")
+        st.divider()
+
+        # ── HARVEST PROGRESS PER CROP ──
+        st.subheader("Harvest Progress — Actual vs Expected (kg)")
+        st.caption("How much of the expected harvest has been collected so far.")
+
+        fig_progress = go.Figure()
+        for _, row in prod_display.iterrows():
+            label = f"{row['Crop']} ({row['Location']})"
+            fig_progress.add_trace(go.Bar(
+                name="Actual",
+                x=[label],
+                y=[row["Actual Harvest (kg)"]],
+                marker_color="#2e7d32",
+                showlegend=_ == 0
+            ))
+            fig_progress.add_trace(go.Bar(
+                name="Remaining",
+                x=[label],
+                y=[row["Remaining (kg)"]],
+                marker_color="#c8e6c9",
+                showlegend=_ == 0
+            ))
+
+        fig_progress.update_layout(
+            barmode="stack",
+            yaxis_title="kg",
+            legend=dict(orientation="h"),
+            margin=dict(l=0, r=0, t=30, b=0)
+        )
+        st.plotly_chart(fig_progress, use_container_width=True)
+
+        st.divider()
+
+        # ── BY LOCATION ──
         col_l, col_r = st.columns(2)
 
         with col_l:
-            status_counts = prod_df["Status"].value_counts().reset_index()
-            status_counts.columns = ["Status", "Count"]
-            fig_status = px.pie(
-                status_counts, values="Count", names="Status",
+            st.subheader("Crops by Location")
+            loc_counts = prod_display.groupby("Location")["Crop"].count().reset_index()
+            loc_counts.columns = ["Location", "Number of Crops"]
+            fig_loc = px.pie(
+                loc_counts, values="Number of Crops", names="Location",
                 color_discrete_sequence=px.colors.sequential.Greens
             )
-            st.plotly_chart(fig_status, use_container_width=True)
+            fig_loc.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_loc, use_container_width=True)
 
         with col_r:
-            fig_rows = px.bar(
-                prod_df.sort_values("Rows", ascending=False),
-                x="Crop", y="Rows", color="Status",
-                color_discrete_sequence=px.colors.sequential.Greens
+            st.subheader("Expected Harvest by Location (kg)")
+            loc_harvest = prod_display.groupby("Location").agg(
+                Expected=("Expected Harvest (kg)", "sum"),
+                Actual=("Actual Harvest (kg)", "sum")
+            ).reset_index()
+            fig_loc_h = go.Figure()
+            fig_loc_h.add_trace(go.Bar(
+                name="Expected", x=loc_harvest["Location"],
+                y=loc_harvest["Expected"], marker_color="#a5d6a7"
+            ))
+            fig_loc_h.add_trace(go.Bar(
+                name="Actual", x=loc_harvest["Location"],
+                y=loc_harvest["Actual"], marker_color="#2e7d32"
+            ))
+            fig_loc_h.update_layout(
+                barmode="group", yaxis_title="kg",
+                legend=dict(orientation="h"),
+                margin=dict(l=0, r=0, t=30, b=0)
             )
-            fig_rows.update_layout(yaxis_title="Number of Rows")
-            st.plotly_chart(fig_rows, use_container_width=True)
+            st.plotly_chart(fig_loc_h, use_container_width=True)
 
-        st.subheader("Production Records")
-        prod_df["Days Since Planted"] = (
-            pd.Timestamp(date.today()) - pd.to_datetime(prod_df["Date Planted"])
-        ).dt.days
-        st.dataframe(prod_df, use_container_width=True, hide_index=False)
+        st.divider()
 
-        delete_idx = st.number_input(
-            "Delete record by row number (from table above)",
-            min_value=0, max_value=max(len(prod_df) - 1, 0), value=0, step=1
-        )
-        if st.button("🗑️ Delete selected row"):
-            prod_df = prod_df.drop(index=delete_idx).reset_index(drop=True)
-            prod_df.to_csv(str(PROD_FILE), index=False)
-            st.success("Record deleted.")
-            st.rerun()
+        # ── FULL PRODUCTION TABLE ──
+        st.subheader("All Production Records")
+        display_cols = [
+            "Crop", "Location", "Date Planted", "Rows", "Total Plants",
+            "Expected Harvest (kg)", "Actual Harvest (kg)", "Harvest Progress (%)",
+            "First Harvest Date", "Last Harvest Date", "Status", "Notes"
+        ]
+        display_cols = [c for c in display_cols if c in prod_display.columns]
 
-        prod_csv = prod_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Production Data as CSV",
-            data=prod_csv, file_name="greenhouse_production.csv", mime="text/csv"
-        )
+        # Format dates nicely
+        show_df = prod_display[display_cols].copy()
+        for dcol in ["Date Planted", "First Harvest Date", "Last Harvest Date"]:
+            if dcol in show_df.columns:
+                show_df[dcol] = pd.to_datetime(show_df[dcol]).dt.strftime("%d %b %Y").replace("NaT", "—")
+
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── HARVEST LOG ──
+        st.subheader("Harvest Log")
+        if harvest_df.empty:
+            st.info(
+                "No harvest records yet. Add rows to the **Harvest Log** sheet "
+                "in your Excel file as you harvest."
+            )
+        else:
+            # Summary per crop
+            harvest_summary = harvest_df.groupby("Crop").agg(
+                Total_Harvested=("Kg Harvested", "sum"),
+                First_Date=("Date", "min"),
+                Last_Date=("Date", "max"),
+                Num_Harvests=("Date", "count")
+            ).reset_index()
+            harvest_summary.columns = [
+                "Crop", "Total Harvested (kg)",
+                "First Harvest", "Last Harvest", "# Harvests"
+            ]
+
+            col_l2, col_r2 = st.columns(2)
+            with col_l2:
+                st.markdown("**Cumulative Harvest per Crop**")
+                st.dataframe(harvest_summary, use_container_width=True, hide_index=True)
+
+            with col_r2:
+                fig_harv = px.bar(
+                    harvest_summary.sort_values("Total Harvested (kg)", ascending=False),
+                    x="Crop", y="Total Harvested (kg)",
+                    color="Total Harvested (kg)",
+                    color_continuous_scale="Greens"
+                )
+                fig_harv.update_layout(
+                    coloraxis_showscale=False,
+                    margin=dict(l=0, r=0, t=30, b=0)
+                )
+                st.plotly_chart(fig_harv, use_container_width=True)
+
+            # Harvest over time
+            st.markdown("**Harvest Over Time**")
+            fig_time = px.line(
+                harvest_df.sort_values("Date"),
+                x="Date", y="Kg Harvested", color="Crop",
+                markers=True
+            )
+            fig_time.update_xaxes(
+                range=[harvest_df["Date"].min(), harvest_df["Date"].max()]
+            )
+            fig_time.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_time, use_container_width=True)
+
+            # Full log
+            st.markdown("**Full Harvest Log**")
+            st.dataframe(
+                harvest_df.sort_values("Date", ascending=False),
+                use_container_width=True, hide_index=True
+            )
+
+        # Download buttons
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            prod_csv = prod_display.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Production Data",
+                data=prod_csv,
+                file_name="production_tracker.csv",
+                mime="text/csv"
+            )
+        with col_d2:
+            if not harvest_df.empty:
+                harv_csv = harvest_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download Harvest Log",
+                    data=harv_csv,
+                    file_name="harvest_log.csv",
+                    mime="text/csv"
+                )
+
 
 # ── FOOTER ──
 st.divider()
